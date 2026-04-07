@@ -1,0 +1,70 @@
+from io import BytesIO
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+
+MESES = [
+    "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"
+]
+
+def normalizar_colunas(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+@app.get("/")
+def home():
+    return {"ok": True, "mensagem": "API online"}
+
+@app.post("/transformar")
+async def transformar(file: UploadFile = File(...)):
+    try:
+        conteudo = await file.read()
+        entrada = BytesIO(conteudo)
+
+        df = pd.read_excel(entrada)
+        df = normalizar_colunas(df)
+
+        colunas_fixas = ["Cliente", "Produto"]
+        faltando_fixas = [c for c in colunas_fixas if c not in df.columns]
+        if faltando_fixas:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Colunas obrigatórias ausentes: {faltando_fixas}"
+            )
+
+        meses_existentes = [m for m in MESES if m in df.columns]
+        if not meses_existentes:
+            raise HTTPException(
+                status_code=400,
+                detail="Nenhuma coluna de mês encontrada."
+            )
+
+        df_final = df.melt(
+            id_vars=colunas_fixas,
+            value_vars=meses_existentes,
+            var_name="MÊS",
+            value_name="Movimentação(TON)"
+        )
+
+        df_final = df_final[df_final["Movimentação(TON)"].notna()].copy()
+        df_final["ANO"] = 2026
+        df_final = df_final[["ANO", "MÊS", "Cliente", "Produto", "Movimentação(TON)"]]
+
+        saida = BytesIO()
+        with pd.ExcelWriter(saida, engine="openpyxl") as writer:
+            df_final.to_excel(writer, index=False, sheet_name="Base Padronizada")
+        saida.seek(0)
+
+        return StreamingResponse(
+            saida,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=base_padronizada.xlsx"}
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
