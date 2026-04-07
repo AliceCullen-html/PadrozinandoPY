@@ -2,8 +2,17 @@ from io import BytesIO
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 ABA_ALVO = "Projeção - Ton. Movimentação"
 
@@ -66,7 +75,6 @@ async def transformar(file: UploadFile = File(...)):
 
         df_final = df_final[df_final["Movimentação(TON)"].notna()].copy()
 
-        # Remove vazios reais
         df_final["Cliente"] = df_final["Cliente"].astype(str).str.strip()
         df_final["Produto"] = df_final["Produto"].astype(str).str.strip()
 
@@ -77,7 +85,6 @@ async def transformar(file: UploadFile = File(...)):
             (df_final["Produto"].str.lower() != "nan")
         ].copy()
 
-        # Tenta converter número
         df_final["Movimentação(TON)"] = (
             df_final["Movimentação(TON)"]
             .astype(str)
@@ -92,7 +99,6 @@ async def transformar(file: UploadFile = File(...)):
 
         df_final = df_final[df_final["Movimentação(TON)"].notna()].copy()
 
-        # Ano fixo por enquanto
         df_final["ANO"] = 2026
 
         df_final = df_final[[
@@ -113,7 +119,8 @@ async def transformar(file: UploadFile = File(...)):
             saida,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={
-                "Content-Disposition": "attachment; filename=base_padronizada.xlsx"
+                "Content-Disposition": "attachment; filename=base_padronizada.xlsx",
+                "Access-Control-Expose-Headers": "Content-Disposition"
             }
         )
 
