@@ -25,7 +25,12 @@ async def transformar(file: UploadFile = File(...)):
         conteudo = await file.read()
         entrada = BytesIO(conteudo)
 
-        df = pd.read_excel(entrada)
+        xls = pd.ExcelFile(entrada)
+
+if "Projeção - Vol. Movimentação" not in xls.sheet_names:
+    raise Exception("A aba correta não foi encontrada")
+
+df = pd.read_excel(xls, sheet_name="Projeção - Vol. Movimentação", header=1)
         df = normalizar_colunas(df)
 
         colunas_fixas = ["Cliente", "Produto"]
