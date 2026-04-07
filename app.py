@@ -1,10 +1,11 @@
-
 from io import BytesIO
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 
 app = FastAPI()
+
+ABA_ALVO = "Projeção - Ton. Movimentação"
 
 MESES = [
     "janeiro", "fevereiro", "março", "abril", "maio", "junho",
@@ -27,10 +28,18 @@ async def transformar(file: UploadFile = File(...)):
 
         xls = pd.ExcelFile(entrada)
 
-if "Projeção - Vol. Movimentação" not in xls.sheet_names:
-    raise Exception("A aba correta não foi encontrada")
+        if ABA_ALVO not in xls.sheet_names:
+            raise HTTPException(
+                status_code=400,
+                detail=f"A aba '{ABA_ALVO}' não foi encontrada no arquivo."
+            )
 
-df = pd.read_excel(xls, sheet_name="Projeção - Vol. Movimentação", header=1)
+        df = pd.read_excel(
+            xls,
+            sheet_name=ABA_ALVO,
+            header=1
+        )
+
         df = normalizar_colunas(df)
 
         colunas_fixas = ["Cliente", "Produto"]
@@ -56,21 +65,62 @@ df = pd.read_excel(xls, sheet_name="Projeção - Vol. Movimentação", header=1)
         )
 
         df_final = df_final[df_final["Movimentação(TON)"].notna()].copy()
+
+        # Remove vazios reais
+        df_final["Cliente"] = df_final["Cliente"].astype(str).str.strip()
+        df_final["Produto"] = df_final["Produto"].astype(str).str.strip()
+
+        df_final = df_final[
+            (df_final["Cliente"] != "") &
+            (df_final["Produto"] != "") &
+            (df_final["Cliente"].str.lower() != "nan") &
+            (df_final["Produto"].str.lower() != "nan")
+        ].copy()
+
+        # Tenta converter número
+        df_final["Movimentação(TON)"] = (
+            df_final["Movimentação(TON)"]
+            .astype(str)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", ".", regex=False)
+        )
+
+        df_final["Movimentação(TON)"] = pd.to_numeric(
+            df_final["Movimentação(TON)"],
+            errors="coerce"
+        )
+
+        df_final = df_final[df_final["Movimentação(TON)"].notna()].copy()
+
+        # Ano fixo por enquanto
         df_final["ANO"] = 2026
-        df_final = df_final[["ANO", "MÊS", "Cliente", "Produto", "Movimentação(TON)"]]
+
+        df_final = df_final[[
+            "ANO",
+            "MÊS",
+            "Cliente",
+            "Produto",
+            "Movimentação(TON)"
+        ]]
 
         saida = BytesIO()
         with pd.ExcelWriter(saida, engine="openpyxl") as writer:
             df_final.to_excel(writer, index=False, sheet_name="Base Padronizada")
+
         saida.seek(0)
 
         return StreamingResponse(
             saida,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=base_padronizada.xlsx"}
+            headers={
+                "Content-Disposition": "attachment; filename=base_padronizada.xlsx"
+            }
         )
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao processar arquivo: {str(e)}"
+        )
