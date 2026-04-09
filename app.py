@@ -118,100 +118,187 @@ async def transformar_terminal(file: UploadFile = File(...)):
         elif nome.endswith(".xlsx") or nome.endswith(".xlsm"):
             engine = "openpyxl"
         else:
-            raise HTTPException(status_code=400, detail="Formato inválido.")
+            raise HTTPException(
+                status_code=400,
+                detail="Formato inválido. Envie .xls, .xlsx ou .xlsm."
+            )
 
         conteudo = await file.read()
         entrada = BytesIO(conteudo)
 
-        df = pd.read_excel(entrada, header=None, engine=engine)
+        # lê bruto
+        df_raw = pd.read_excel(entrada, header=None, engine=engine)
 
-        # corta após "Total mensal"
-        idx_total = df[
-            df.astype(str).apply(
-                lambda row: row.str.strip().str.lower().eq("total mensal").any(),
-                axis=1
-            )
-        ].index
+        # corta antes de tudo que vem abaixo de "Total mensal"
+        mask_total_mensal = df_raw.astype(str).apply(
+            lambda row: row.str.strip().str.lower().eq("total mensal").any(),
+            axis=1
+        )
 
+        idx_total = df_raw.index[mask_total_mensal]
         if len(idx_total) > 0:
-            df = df.loc[:idx_total[0] - 1]
+            fim = idx_total.tolist()[0]
+            df_raw = df_raw.loc[:fim - 1].copy()
 
-        # acha cabeçalho
+        # acha linha do cabeçalho real
         header_idx = None
-        for i in df.index:
-            linha = df.loc[i].astype(str).str.lower().tolist()
-            if "terminal" in linha and "produto" in linha:
+        for i in df_raw.index:
+            linha = [str(x).strip().lower() for x in df_raw.loc[i].tolist()]
+            if "terminal" in linha and "produto" in linha and "operação" in linha:
+                header_idx = i
+                break
+            if "terminal" in linha and "produto" in linha and "operacao" in linha:
                 header_idx = i
                 break
 
         if header_idx is None:
-            raise HTTPException(status_code=400, detail="Cabeçalho não encontrado")
+            raise HTTPException(
+                status_code=400,
+                detail="Não foi possível localizar o cabeçalho da tabela principal."
+            )
 
-        header = df.loc[header_idx]
-        df = df.loc[header_idx + 1:]
+        header = [str(x).strip() for x in df_raw.loc[header_idx].tolist()]
+        df = df_raw.loc[header_idx + 1:].copy()
         df.columns = header
 
+        # remove colunas totalmente vazias
+        df = df.dropna(axis=1, how="all").copy()
+
+        # normaliza nomes
         df.columns = [str(c).strip() for c in df.columns]
 
-        df["TERMINAL"] = df["TERMINAL"].ffill()
-
-        df = df[
-            (~df["PRODUTO"].astype(str).str.lower().eq("total")) &
-            (df["PRODUTO"].notna())
-        ]
-
-        # meses
-        cols_meses = [c for c in df.columns if "/" in str(c)]
-
-        df_long = df.melt(
-            id_vars=["TERMINAL", "PRODUTO", "OPERAÇÃO"],
-            value_vars=cols_meses,
-            var_name="MES_ANO",
-            value_name="Mov"
+        # localiza nomes reais das colunas
+        col_terminal = next((c for c in df.columns if str(c).strip().upper() == "TERMINAL"), None)
+        col_produto = next((c for c in df.columns if str(c).strip().upper() == "PRODUTO"), None)
+        col_operacao = next(
+            (c for c in df.columns if str(c).strip().upper() in ["OPERAÇÃO", "OPERACAO"]),
+            None
         )
 
-        df_long["Mov"] = pd.to_numeric(df_long["Mov"], errors="coerce")
-        df_long = df_long[df_long["Mov"].notna()]
+        faltando = [x for x in ["TERMINAL", "PRODUTO", "OPERAÇÃO"] if {
+            "TERMINAL": col_terminal,
+            "PRODUTO": col_produto,
+            "OPERAÇÃO": col_operacao
+        }[x] is None]
 
-        partes = df_long["MES_ANO"].str.split("/", expand=True)
+        if faltando:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Colunas obrigatórias ausentes: {faltando}"
+            )
 
-        mapa = {
-            "jan": "Janeiro", "fev": "Fevereiro", "mar": "Março",
-            "abr": "Abril", "mai": "Maio", "jun": "Junho",
-            "jul": "Julho", "ago": "Agosto", "set": "Setembro",
-            "out": "Outubro", "nov": "Novembro", "dez": "Dezembro"
+        # mantém só até a tabela principal
+        df[col_terminal] = df[col_terminal].ffill()
+
+        df[col_terminal] = df[col_terminal].astype(str).str.strip()
+        df[col_produto] = df[col_produto].astype(str).str.strip()
+        df[col_operacao] = df[col_operacao].astype(str).str.strip()
+
+        # remove linhas inúteis
+        df = df[
+            (df[col_produto] != "") &
+            (df[col_produto].str.lower() != "nan") &
+            (~df[col_produto].str.lower().eq("total")) &
+            (~df[col_terminal].str.lower().str.contains("total mensal", na=False)) &
+            (~df[col_terminal].str.lower().eq("nan"))
+        ].copy()
+
+        # colunas de mês válidas: jan/21, fev/21...
+        regex_mes = re.compile(r"^(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)/\d{2}$", re.IGNORECASE)
+        colunas_meses = [c for c in df.columns if regex_mes.match(str(c).strip())]
+
+        if not colunas_meses:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Nenhuma coluna de mês/ano encontrada. Colunas lidas: {list(df.columns)}"
+            )
+
+        df_long = df.melt(
+            id_vars=[col_terminal, col_produto, col_operacao],
+            value_vars=colunas_meses,
+            var_name="MES_ANO",
+            value_name="Mov (TON)"
+        )
+
+        # converte valores
+        df_long["Mov (TON)"] = (
+            df_long["Mov (TON)"]
+            .astype(str)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", ".", regex=False)
+        )
+        df_long["Mov (TON)"] = pd.to_numeric(df_long["Mov (TON)"], errors="coerce")
+        df_long = df_long[df_long["Mov (TON)"].notna()].copy()
+
+        mapa_meses = {
+            "jan": ("Janeiro", 1),
+            "fev": ("Fevereiro", 2),
+            "mar": ("Março", 3),
+            "abr": ("Abril", 4),
+            "mai": ("Maio", 5),
+            "jun": ("Junho", 6),
+            "jul": ("Julho", 7),
+            "ago": ("Agosto", 8),
+            "set": ("Setembro", 9),
+            "out": ("Outubro", 10),
+            "nov": ("Novembro", 11),
+            "dez": ("Dezembro", 12),
         }
 
-        df_long["MÊS"] = partes[0].str[:3].map(mapa)
-        df_long["ANO"] = ("20" + partes[1]).astype(int)
+        df_long["MES_ANO"] = df_long["MES_ANO"].astype(str).str.strip().str.lower()
+        partes = df_long["MES_ANO"].str.split("/", n=1, expand=True)
+
+        if partes.shape[1] < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Não foi possível separar mês/ano das colunas."
+            )
+
+        df_long["MES_SIGLA"] = partes[0].str[:3]
+        df_long["ANO"] = pd.to_numeric("20" + partes[1], errors="coerce")
+        df_long["MÊS"] = df_long["MES_SIGLA"].map(lambda x: mapa_meses.get(x, ("", None))[0])
+        df_long["MES_NUM"] = df_long["MES_SIGLA"].map(lambda x: mapa_meses.get(x, ("", None))[1])
+
+        df_long = df_long[df_long["ANO"].notna()].copy()
+        df_long = df_long[df_long["MES_NUM"].notna()].copy()
+
+        df_long["ANO"] = df_long["ANO"].astype(int)
 
         df_long["Data"] = pd.to_datetime(
-            dict(year=df_long["ANO"], month=1, day=1)
+            dict(year=df_long["ANO"], month=df_long["MES_NUM"].astype(int), day=1)
         )
 
         df_final = df_long.rename(columns={
-            "TERMINAL": "TERMINAL",
-            "PRODUTO": "PRODUTO",
-            "OPERAÇÃO": "Operação",
-            "Mov": "Mov (TON)"
+            col_terminal: "TERMINAL",
+            col_produto: "PRODUTO",
+            col_operacao: "Operação"
         })
 
         df_final["GRUPO DE PRODUTOS"] = None
 
         df_final = df_final[
-            ["TERMINAL", "ANO", "MÊS", "PRODUTO",
-             "GRUPO DE PRODUTOS", "Mov (TON)", "Data", "Operação"]
-        ]
+            ["TERMINAL", "ANO", "MÊS", "PRODUTO", "GRUPO DE PRODUTOS", "Mov (TON)", "Data", "Operação"]
+        ].copy()
 
         saida = BytesIO()
-        df_final.to_excel(saida, index=False)
+        with pd.ExcelWriter(saida, engine="openpyxl") as writer:
+            df_final.to_excel(writer, index=False, sheet_name="Base Padronizada")
+
         saida.seek(0)
 
         return StreamingResponse(
             saida,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=terminal.xlsx"}
+            headers={
+                "Content-Disposition": "attachment; filename=base_terminal_padronizada.xlsx",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao processar base de terminais: {repr(e)}"
+        )
