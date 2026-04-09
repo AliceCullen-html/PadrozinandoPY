@@ -262,7 +262,6 @@ async def transformar_terminal(file: UploadFile = File(...)):
 
         df_raw = pd.read_excel(entrada, header=None, engine=engine)
 
-        # corta tudo abaixo de "Total mensal"
         mask_total_mensal = df_raw.astype(str).apply(
             lambda row: row.str.strip().str.lower().eq("total mensal").any(),
             axis=1
@@ -273,7 +272,6 @@ async def transformar_terminal(file: UploadFile = File(...)):
             fim = idx_total.tolist()[0]
             df_raw = df_raw.loc[:fim - 1].copy()
 
-        # acha linha do cabeçalho real
         header_idx = None
         for i in df_raw.index:
             linha = [str(x).strip().lower() for x in df_raw.loc[i].tolist()]
@@ -315,14 +313,13 @@ async def transformar_terminal(file: UploadFile = File(...)):
                 detail=f"Colunas obrigatórias ausentes: {faltando}"
             )
 
-        # pega só o quadrado: TERMINAL | PRODUTO | OPERAÇÃO | 12 meses
         cols = list(df.columns)
         idx_terminal = cols.index(col_terminal)
         idx_produto = cols.index(col_produto)
         idx_operacao = cols.index(col_operacao)
 
         inicio = min(idx_terminal, idx_produto, idx_operacao)
-        fim_meses = idx_operacao + 12  # exatamente 12 colunas após operação
+        fim_meses = idx_operacao + 12
 
         if fim_meses >= len(cols):
             fim_meses = len(cols) - 1
@@ -330,7 +327,6 @@ async def transformar_terminal(file: UploadFile = File(...)):
         cols_bloco = cols[inicio:fim_meses + 1]
         df = df[cols_bloco].copy()
 
-        # redefine nomes após corte
         col_terminal = next((c for c in df.columns if str(c).strip().upper() == "TERMINAL"), None)
         col_produto = next((c for c in df.columns if str(c).strip().upper() == "PRODUTO"), None)
         col_operacao = next(
@@ -338,19 +334,16 @@ async def transformar_terminal(file: UploadFile = File(...)):
             None
         )
 
-        # propaga terminal
         df[col_terminal] = df[col_terminal].ffill()
 
         df[col_terminal] = df[col_terminal].astype(str).str.strip()
         df[col_produto] = df[col_produto].astype(str).str.strip()
         df[col_operacao] = df[col_operacao].astype(str).str.strip()
 
-        # meses = exatamente as 12 colunas após operação
         cols = list(df.columns)
         idx_operacao = cols.index(col_operacao)
         colunas_meses = cols[idx_operacao + 1: idx_operacao + 13]
 
-        # garante que sejam datas/mês válidos
         colunas_meses_validas = []
         for c in colunas_meses:
             ano, mes = extrair_mes_ano(c)
@@ -363,7 +356,6 @@ async def transformar_terminal(file: UploadFile = File(...)):
                 detail=f"Não encontrei as 12 colunas mensais esperadas. Colunas lidas: {list(df.columns)}"
             )
 
-        # remove linhas inválidas
         operacoes_validas = ["imp", "exp", "cab", "exp/imp"]
 
         df = df[
@@ -377,8 +369,10 @@ async def transformar_terminal(file: UploadFile = File(...)):
             (df[col_operacao].str.lower().isin(operacoes_validas))
         ].copy()
 
-        # mantém só linhas com pelo menos 1 valor mensal preenchido
-        temp_meses = df[colunas_meses_validas].applymap(converter_mov)
+        temp_meses = df[colunas_meses_validas].copy()
+        for col in colunas_meses_validas:
+            temp_meses[col] = temp_meses[col].apply(converter_mov)
+
         mask_tem_valor = temp_meses.notna().any(axis=1)
         df = df[mask_tem_valor].copy()
 
