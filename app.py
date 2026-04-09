@@ -34,7 +34,7 @@ MAPA_MESES = {
     9: "Setembro",
     10: "Outubro",
     11: "Novembro",
-    12: "Dezembro"
+    12: "Dezembro",
 }
 
 SIGLA_PARA_MES = {
@@ -49,16 +49,16 @@ SIGLA_PARA_MES = {
     "set": 9,
     "out": 10,
     "nov": 11,
-    "dez": 12
+    "dez": 12,
 }
 
 
-def normalizar_colunas(df):
+def normalizar_colunas(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-def ct_valido(valor):
+def ct_valido(valor) -> bool:
     if pd.isna(valor):
         return False
     texto = str(valor).strip().upper()
@@ -70,13 +70,13 @@ def detectar_engine(nome_arquivo: str) -> str:
 
     if nome.endswith(".xls"):
         return "xlrd"
-    elif nome.endswith(".xlsx") or nome.endswith(".xlsm"):
+    if nome.endswith(".xlsx") or nome.endswith(".xlsm"):
         return "openpyxl"
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Formato inválido. Envie .xls, .xlsx ou .xlsm."
-        )
+
+    raise HTTPException(
+        status_code=400,
+        detail="Formato inválido. Envie .xls, .xlsx ou .xlsm."
+    )
 
 
 def extrair_mes_ano(valor):
@@ -85,6 +85,7 @@ def extrair_mes_ano(valor):
 
     texto = str(valor).strip()
 
+    # caso venha como data string: 2021-01-01 00:00:00
     try:
         dt = pd.to_datetime(texto, errors="raise")
         if pd.notna(dt):
@@ -92,6 +93,7 @@ def extrair_mes_ano(valor):
     except Exception:
         pass
 
+    # caso venha como jan/21
     m = re.match(r"^(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)/(\d{2})$", texto.lower())
     if m:
         sigla = m.group(1)
@@ -100,6 +102,31 @@ def extrair_mes_ano(valor):
         return ano, mes
 
     return None, None
+
+
+def converter_mov(valor):
+    if pd.isna(valor):
+        return None
+
+    if isinstance(valor, (int, float)) and not isinstance(valor, bool):
+        return float(valor)
+
+    texto = str(valor).strip()
+
+    if texto == "" or texto.lower() == "nan":
+        return None
+
+    # ignora textos de data/hora
+    if re.match(r"^\d{4}-\d{2}-\d{2}", texto):
+        return None
+
+    # tratamento pt-BR
+    texto = texto.replace(".", "").replace(",", ".")
+
+    try:
+        return float(texto)
+    except Exception:
+        return None
 
 
 @app.get("/")
@@ -298,11 +325,14 @@ async def transformar_terminal(file: UploadFile = File(...)):
         df[col_produto] = df[col_produto].astype(str).str.strip()
         df[col_operacao] = df[col_operacao].astype(str).str.strip()
 
+        # remove linhas inúteis e totais
         df = df[
             (df[col_produto] != "") &
             (df[col_produto].str.lower() != "nan") &
             (~df[col_produto].str.lower().eq("total")) &
+            (~df[col_terminal].str.lower().eq("total")) &
             (~df[col_terminal].str.lower().str.contains("total mensal", na=False)) &
+            (~df[col_terminal].str.lower().str.contains("^total", na=False, regex=True)) &
             (~df[col_terminal].str.lower().eq("nan"))
         ].copy()
 
@@ -326,15 +356,17 @@ async def transformar_terminal(file: UploadFile = File(...)):
             value_name="Mov (TON)"
         )
 
-        df_long["Mov (TON)"] = (
-            df_long["Mov (TON)"]
-            .astype(str)
-            .str.replace(".", "", regex=False)
-            .str.replace(",", ".", regex=False)
-        )
+        # filtro extra de segurança para totais
+        df_long = df_long[
+            ~df_long[col_terminal].astype(str).str.strip().str.lower().str.startswith("total", na=False)
+        ].copy()
 
-        df_long["Mov (TON)"] = pd.to_numeric(df_long["Mov (TON)"], errors="coerce")
+        df_long["Mov (TON)"] = df_long["Mov (TON)"].apply(converter_mov)
         df_long = df_long[df_long["Mov (TON)"].notna()].copy()
+
+        # remove zeros e lixos absurdos
+        df_long = df_long[df_long["Mov (TON)"] > 0].copy()
+        df_long = df_long[df_long["Mov (TON)"] < 1000000].copy()
 
         df_long[["ANO", "MES_NUM"]] = df_long["MES_ANO"].apply(
             lambda x: pd.Series(extrair_mes_ano(x))
