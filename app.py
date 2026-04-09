@@ -85,7 +85,6 @@ def extrair_mes_ano(valor):
 
     texto = str(valor).strip()
 
-    # caso venha como data string: 2021-01-01 00:00:00
     try:
         dt = pd.to_datetime(texto, errors="raise")
         if pd.notna(dt):
@@ -93,7 +92,6 @@ def extrair_mes_ano(valor):
     except Exception:
         pass
 
-    # caso venha como jan/21
     m = re.match(r"^(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)/(\d{2})$", texto.lower())
     if m:
         sigla = m.group(1)
@@ -116,11 +114,9 @@ def converter_mov(valor):
     if texto == "" or texto.lower() == "nan":
         return None
 
-    # ignora textos de data/hora
     if re.match(r"^\d{4}-\d{2}-\d{2}", texto):
         return None
 
-    # tratamento pt-BR
     texto = texto.replace(".", "").replace(",", ".")
 
     try:
@@ -266,7 +262,6 @@ async def transformar_terminal(file: UploadFile = File(...)):
 
         df_raw = pd.read_excel(entrada, header=None, engine=engine)
 
-        # corta tudo abaixo de "Total mensal"
         mask_total_mensal = df_raw.astype(str).apply(
             lambda row: row.str.strip().str.lower().eq("total mensal").any(),
             axis=1
@@ -277,7 +272,6 @@ async def transformar_terminal(file: UploadFile = File(...)):
             fim = idx_total.tolist()[0]
             df_raw = df_raw.loc[:fim - 1].copy()
 
-        # acha linha do cabeçalho real
         header_idx = None
         for i in df_raw.index:
             linha = [str(x).strip().lower() for x in df_raw.loc[i].tolist()]
@@ -325,7 +319,7 @@ async def transformar_terminal(file: UploadFile = File(...)):
         df[col_produto] = df[col_produto].astype(str).str.strip()
         df[col_operacao] = df[col_operacao].astype(str).str.strip()
 
-        # remove linhas inúteis e totais
+        # remove linhas sem produto, totais e lixo
         df = df[
             (df[col_produto] != "") &
             (df[col_produto].str.lower() != "nan") &
@@ -336,7 +330,9 @@ async def transformar_terminal(file: UploadFile = File(...)):
             (~df[col_terminal].str.lower().eq("nan"))
         ].copy()
 
-        # colunas de mês
+        # remove qualquer linha onde o produto ficou vazio de novo após limpeza
+        df = df[df[col_produto].astype(str).str.strip() != ""].copy()
+
         colunas_meses = []
         for c in df.columns:
             ano, mes = extrair_mes_ano(c)
@@ -356,15 +352,22 @@ async def transformar_terminal(file: UploadFile = File(...)):
             value_name="Mov (TON)"
         )
 
-        # filtro extra de segurança para totais
+        # segurança extra: remove totais e linhas sem produto após melt
         df_long = df_long[
             ~df_long[col_terminal].astype(str).str.strip().str.lower().str.startswith("total", na=False)
+        ].copy()
+
+        df_long = df_long[
+            df_long[col_produto].astype(str).str.strip().ne("")
+        ].copy()
+
+        df_long = df_long[
+            ~df_long[col_produto].astype(str).str.strip().str.lower().isin(["nan", "total"])
         ].copy()
 
         df_long["Mov (TON)"] = df_long["Mov (TON)"].apply(converter_mov)
         df_long = df_long[df_long["Mov (TON)"].notna()].copy()
 
-        # remove zeros e lixos absurdos
         df_long = df_long[df_long["Mov (TON)"] > 0].copy()
         df_long = df_long[df_long["Mov (TON)"] < 1000000].copy()
 
