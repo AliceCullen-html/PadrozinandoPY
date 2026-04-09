@@ -262,6 +262,7 @@ async def transformar_terminal(file: UploadFile = File(...)):
 
         df_raw = pd.read_excel(entrada, header=None, engine=engine)
 
+        # corta tudo abaixo de "Total mensal"
         mask_total_mensal = df_raw.astype(str).apply(
             lambda row: row.str.strip().str.lower().eq("total mensal").any(),
             axis=1
@@ -272,6 +273,7 @@ async def transformar_terminal(file: UploadFile = File(...)):
             fim = idx_total.tolist()[0]
             df_raw = df_raw.loc[:fim - 1].copy()
 
+        # acha cabeçalho real
         header_idx = None
         for i in df_raw.index:
             linha = [str(x).strip().lower() for x in df_raw.loc[i].tolist()]
@@ -313,36 +315,51 @@ async def transformar_terminal(file: UploadFile = File(...)):
                 detail=f"Colunas obrigatórias ausentes: {faltando}"
             )
 
+        # propaga terminal
         df[col_terminal] = df[col_terminal].ffill()
 
         df[col_terminal] = df[col_terminal].astype(str).str.strip()
         df[col_produto] = df[col_produto].astype(str).str.strip()
         df[col_operacao] = df[col_operacao].astype(str).str.strip()
 
-        # remove linhas sem produto, totais e lixo
+        # remove lixo
         df = df[
             (df[col_produto] != "") &
             (df[col_produto].str.lower() != "nan") &
             (~df[col_produto].str.lower().eq("total")) &
             (~df[col_terminal].str.lower().eq("total")) &
             (~df[col_terminal].str.lower().str.contains("total mensal", na=False)) &
-            (~df[col_terminal].str.lower().str.contains("^total", na=False, regex=True)) &
+            (~df[col_terminal].str.lower().str.startswith("total", na=False)) &
             (~df[col_terminal].str.lower().eq("nan"))
         ].copy()
 
-        # remove qualquer linha onde o produto ficou vazio de novo após limpeza
-        df = df[df[col_produto].astype(str).str.strip() != ""].copy()
+        # mantém só operações válidas
+        operacoes_validas = ["imp", "exp", "cab", "exp/imp"]
+        df = df[
+            df[col_operacao].astype(str).str.strip().str.lower().isin(operacoes_validas)
+        ].copy()
+
+        # ============================
+        # PEGA SÓ OS 12 MESES APÓS OPERAÇÃO
+        # ============================
+        cols = list(df.columns)
+        idx_operacao = cols.index(col_operacao)
+
+        candidatos = cols[idx_operacao + 1:]
 
         colunas_meses = []
-        for c in df.columns:
+        for c in candidatos:
             ano, mes = extrair_mes_ano(c)
             if ano is not None and mes is not None:
                 colunas_meses.append(c)
 
-        if not colunas_meses:
+        # mantém no máximo 12 meses
+        colunas_meses = colunas_meses[:12]
+
+        if len(colunas_meses) == 0:
             raise HTTPException(
                 status_code=400,
-                detail=f"Nenhuma coluna de mês/ano encontrada. Colunas lidas: {list(df.columns)}"
+                detail=f"Nenhuma coluna mensal encontrada após OPERAÇÃO. Colunas lidas: {list(df.columns)}"
             )
 
         df_long = df.melt(
@@ -352,11 +369,7 @@ async def transformar_terminal(file: UploadFile = File(...)):
             value_name="Mov (TON)"
         )
 
-        # segurança extra: remove totais e linhas sem produto após melt
-        df_long = df_long[
-            ~df_long[col_terminal].astype(str).str.strip().str.lower().str.startswith("total", na=False)
-        ].copy()
-
+        # segurança extra
         df_long = df_long[
             df_long[col_produto].astype(str).str.strip().ne("")
         ].copy()
@@ -365,9 +378,14 @@ async def transformar_terminal(file: UploadFile = File(...)):
             ~df_long[col_produto].astype(str).str.strip().str.lower().isin(["nan", "total"])
         ].copy()
 
+        df_long = df_long[
+            ~df_long[col_terminal].astype(str).str.strip().str.lower().str.startswith("total", na=False)
+        ].copy()
+
         df_long["Mov (TON)"] = df_long["Mov (TON)"].apply(converter_mov)
         df_long = df_long[df_long["Mov (TON)"].notna()].copy()
 
+        # remove zero e valores absurdos
         df_long = df_long[df_long["Mov (TON)"] > 0].copy()
         df_long = df_long[df_long["Mov (TON)"] < 1000000].copy()
 
