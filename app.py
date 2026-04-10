@@ -16,6 +16,7 @@ app.add_middleware(
 )
 
 ABA_ALVO = "Projeção - Ton. Movimentação"
+ABA_FATURAMENTO = "Faturamento"
 
 MESES = [
     "janeiro", "fevereiro", "março", "abril", "maio", "junho",
@@ -125,6 +126,72 @@ def converter_mov(valor):
         return None
 
 
+def converter_moeda_brasileira(valor):
+    if pd.isna(valor):
+        return None
+
+    if isinstance(valor, (int, float)) and not isinstance(valor, bool):
+        return float(valor)
+
+    texto = str(valor).strip()
+
+    if texto == "" or texto.lower() == "nan":
+        return None
+
+    texto = texto.replace("R$", "").replace("$", "").strip()
+    texto = texto.replace(".", "").replace(",", ".")
+
+    texto = re.sub(r"[^\d\.\-]", "", texto)
+
+    if texto in ("", "-", ".", "-."):
+        return None
+
+    try:
+        return float(texto)
+    except Exception:
+        return None
+
+
+def limpar_texto(valor):
+    if pd.isna(valor):
+        return ""
+    return str(valor).strip()
+
+
+def linha_tem_total(row) -> bool:
+    for v in row:
+        txt = str(v).strip().lower()
+        if txt.startswith("total") or txt == "total":
+            return True
+    return False
+
+
+def encontrar_header_faturamento(df_raw: pd.DataFrame):
+    """
+    Procura a linha de cabeçalho real onde existam ao menos:
+    cliente / produto / total / meses
+    """
+    for i in df_raw.index:
+        linha = [str(x).strip().lower() for x in df_raw.loc[i].tolist()]
+
+        tem_cliente = any("cliente" == c for c in linha)
+        tem_produto = any("produto" == c for c in linha)
+        tem_total = any("total" in c for c in linha)
+        qtd_meses = sum(1 for c in linha if c in MESES)
+
+        if tem_cliente and tem_produto and tem_total and qtd_meses >= 6:
+            return i
+
+    return None
+
+
+def encontrar_coluna(df: pd.DataFrame, nomes_possiveis):
+    for c in df.columns:
+        if str(c).strip().lower() in [n.lower() for n in nomes_possiveis]:
+            return c
+    return None
+
+
 @app.get("/")
 def home():
     return {"ok": True, "mensagem": "API online"}
@@ -132,6 +199,7 @@ def home():
 
 # ========================
 # ROTA 1 - BASE COMERCIAL
+# GERA MOVIMENTAÇÃO ORÇADA
 # ========================
 @app.post("/transformar")
 async def transformar(file: UploadFile = File(...)):
@@ -175,8 +243,11 @@ async def transformar(file: UploadFile = File(...)):
                 detail=f"Colunas obrigatórias ausentes: {faltando}"
             )
 
-        meses_existentes = [m for m in MESES if m in df.columns]
-        if not meses_existentes:
+        meses_existentes = [m for m in MESES if m in [str(c).strip().lower() for c in df.columns]]
+        mapa_cols = {str(c).strip().lower(): c for c in df.columns}
+        meses_cols = [mapa_cols[m] for m in meses_existentes if m in mapa_cols]
+
+        if not meses_cols:
             raise HTTPException(
                 status_code=400,
                 detail="Nenhuma coluna de mês encontrada."
@@ -199,7 +270,7 @@ async def transformar(file: UploadFile = File(...)):
 
         df_final = df.melt(
             id_vars=["CT", "Cliente", "Produto"],
-            value_vars=meses_existentes,
+            value_vars=meses_cols,
             var_name="MÊS",
             value_name="Movimentação(TON)"
         )
@@ -212,6 +283,7 @@ async def transformar(file: UploadFile = File(...)):
         df_final = df_final[df_final["Movimentação(TON)"].notna()].copy()
         df_final = df_final[df_final["Movimentação(TON)"] > 0].copy()
 
+        df_final["MÊS"] = df_final["MÊS"].astype(str).str.strip().str.capitalize()
         df_final["ANO"] = 2026
 
         df_final = df_final[[
@@ -248,6 +320,7 @@ async def transformar(file: UploadFile = File(...)):
 
 # ========================
 # ROTA 2 - TERMINAIS
+# GERA MOV REALIZADO
 # ========================
 @app.post("/transformar_terminal")
 async def transformar_terminal(file: UploadFile = File(...)):
@@ -262,7 +335,6 @@ async def transformar_terminal(file: UploadFile = File(...)):
 
         df_raw = pd.read_excel(entrada, header=None, engine=engine)
 
-        # corta tudo abaixo de "Total mensal"
         mask_total_mensal = df_raw.astype(str).apply(
             lambda row: row.str.strip().str.lower().eq("total mensal").any(),
             axis=1
@@ -272,7 +344,6 @@ async def transformar_terminal(file: UploadFile = File(...)):
             fim = idx_total.tolist()[0]
             df_raw = df_raw.loc[:fim - 1].copy()
 
-        # acha cabeçalho real
         header_idx = None
         for i in df_raw.index:
             linha = [str(x).strip().lower() for x in df_raw.loc[i].tolist()]
@@ -290,10 +361,7 @@ async def transformar_terminal(file: UploadFile = File(...)):
         df = df_raw.loc[header_idx + 1:].copy()
         df.columns = header
 
-        # remove colunas totalmente vazias
         df = df.dropna(axis=1, how="all").copy()
-
-        # normaliza nomes
         df.columns = [str(c).strip() for c in df.columns]
         cols = list(df.columns)
 
@@ -321,8 +389,6 @@ async def transformar_terminal(file: UploadFile = File(...)):
                 detail=f"Colunas obrigatórias ausentes: {faltando}"
             )
 
-        # pega exatamente o quadrado útil:
-        # TERMINAL | PRODUTO | OPERAÇÃO | 12 meses
         inicio = min(idx_terminal, idx_produto, idx_operacao)
         fim = idx_operacao + 12
 
@@ -380,7 +446,6 @@ async def transformar_terminal(file: UploadFile = File(...)):
             (df[col_operacao].str.lower().isin(operacoes_validas))
         ].copy()
 
-        # mantém só linhas com pelo menos 1 valor mensal real
         temp_meses = df.loc[:, meses_ok].copy()
         for col in meses_ok:
             temp_meses[col] = temp_meses[col].map(converter_mov)
@@ -409,7 +474,6 @@ async def transformar_terminal(file: UploadFile = File(...)):
 
         df_long["Mov (TON)"] = df_long["Mov (TON)"].map(converter_mov)
         df_long = df_long[df_long["Mov (TON)"].notna()].copy()
-
         df_long = df_long[df_long["Mov (TON)"] > 0].copy()
         df_long = df_long[df_long["Mov (TON)"] < 1000000].copy()
 
@@ -468,4 +532,158 @@ async def transformar_terminal(file: UploadFile = File(...)):
         raise HTTPException(
             status_code=500,
             detail=f"Erro ao processar base de terminais: {repr(e)}"
+        )
+
+
+# ========================
+# ROTA 3 - FATURAMENTO ORÇADO
+# GERA FATURAMENTO ORÇADO
+# ========================
+@app.post("/transformar_faturamento")
+async def transformar_faturamento(file: UploadFile = File(...)):
+    try:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="Arquivo não enviado.")
+
+        engine = detectar_engine(file.filename)
+
+        conteudo = await file.read()
+        entrada = BytesIO(conteudo)
+
+        try:
+            xls = pd.ExcelFile(entrada, engine=engine)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Não foi possível ler o Excel: {str(e)}"
+            )
+
+        if ABA_FATURAMENTO not in xls.sheet_names:
+            raise HTTPException(
+                status_code=400,
+                detail=f"A aba '{ABA_FATURAMENTO}' não foi encontrada no arquivo."
+            )
+
+        df_raw = pd.read_excel(
+            xls,
+            sheet_name=ABA_FATURAMENTO,
+            header=None,
+            engine=engine
+        )
+
+        header_idx = encontrar_header_faturamento(df_raw)
+        if header_idx is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Não foi possível localizar o cabeçalho da aba Faturamento."
+            )
+
+        header = [str(x).strip() for x in df_raw.loc[header_idx].tolist()]
+        df = df_raw.loc[header_idx + 1:].copy()
+        df.columns = header
+
+        df = df.dropna(axis=1, how="all").copy()
+        df = normalizar_colunas(df)
+
+        col_ct = encontrar_coluna(df, ["CT"])
+        col_cliente = encontrar_coluna(df, ["Cliente"])
+        col_produto = encontrar_coluna(df, ["Produto"])
+        col_total = next((c for c in df.columns if "total" in str(c).strip().lower()), None)
+
+        faltando = []
+        if col_ct is None:
+            faltando.append("CT")
+        if col_cliente is None:
+            faltando.append("Cliente")
+        if col_produto is None:
+            faltando.append("Produto")
+
+        if faltando:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Colunas obrigatórias ausentes na aba Faturamento: {faltando}"
+            )
+
+        cols_lower = {str(c).strip().lower(): c for c in df.columns}
+        meses_cols = [cols_lower[m] for m in MESES if m in cols_lower]
+
+        if len(meses_cols) < 12:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Não encontrei as 12 colunas de meses na aba Faturamento. Encontradas: {meses_cols}"
+            )
+
+        cols_utilizadas = [col_ct, col_cliente, col_produto]
+        if col_total is not None:
+            cols_utilizadas.append(col_total)
+        cols_utilizadas += meses_cols
+
+        df = df.loc[:, cols_utilizadas].copy()
+
+        df = df[~df.apply(linha_tem_total, axis=1)].copy()
+
+        df[col_ct] = df[col_ct].astype(str).str.strip()
+        df[col_cliente] = df[col_cliente].astype(str).str.strip()
+        df[col_produto] = df[col_produto].astype(str).str.strip()
+
+        df = df[df[col_ct].apply(ct_valido)].copy()
+
+        df = df[
+            (df[col_cliente] != "") &
+            (df[col_produto] != "") &
+            (df[col_cliente].str.lower() != "nan") &
+            (df[col_produto].str.lower() != "nan") &
+            (~df[col_cliente].str.contains(r"adicione\s*0\s*linha", case=False, na=False)) &
+            (~df[col_produto].str.contains(r"^total$", case=False, na=False))
+        ].copy()
+
+        df_long = df.melt(
+            id_vars=[col_ct, col_cliente, col_produto],
+            value_vars=meses_cols,
+            var_name="MÊS",
+            value_name="Faturamento (R$)"
+        )
+
+        df_long["Faturamento (R$)"] = df_long["Faturamento (R$)"].map(converter_moeda_brasileira)
+
+        df_long = df_long[df_long["Faturamento (R$)"].notna()].copy()
+        df_long = df_long[df_long["Faturamento (R$)"] != 0].copy()
+
+        df_long["MÊS"] = df_long["MÊS"].astype(str).str.strip().str.capitalize()
+        df_long["ANO"] = 2026
+
+        df_final = df_long.rename(columns={
+            col_cliente: "Cliente",
+            col_produto: "Produto"
+        })
+
+        df_final = df_final[[
+            "ANO",
+            "MÊS",
+            "Cliente",
+            "Produto",
+            "Faturamento (R$)"
+        ]].copy()
+
+        saida = BytesIO()
+        with pd.ExcelWriter(saida, engine="openpyxl") as writer:
+            df_final.to_excel(writer, index=False, sheet_name="Base Padronizada")
+
+        saida.seek(0)
+
+        return StreamingResponse(
+            saida,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": "attachment; filename=base_faturamento_padronizada.xlsx",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao processar base de faturamento: {repr(e)}"
         )
