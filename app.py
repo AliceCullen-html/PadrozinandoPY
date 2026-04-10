@@ -262,16 +262,17 @@ async def transformar_terminal(file: UploadFile = File(...)):
 
         df_raw = pd.read_excel(entrada, header=None, engine=engine)
 
+        # corta tudo abaixo de "Total mensal"
         mask_total_mensal = df_raw.astype(str).apply(
             lambda row: row.str.strip().str.lower().eq("total mensal").any(),
             axis=1
         )
-
         idx_total = df_raw.index[mask_total_mensal]
         if len(idx_total) > 0:
             fim = idx_total.tolist()[0]
             df_raw = df_raw.loc[:fim - 1].copy()
 
+        # acha cabeçalho real
         header_idx = None
         for i in df_raw.index:
             linha = [str(x).strip().lower() for x in df_raw.loc[i].tolist()]
@@ -289,8 +290,25 @@ async def transformar_terminal(file: UploadFile = File(...)):
         df = df_raw.loc[header_idx + 1:].copy()
         df.columns = header
 
+        # remove colunas totalmente vazias
         df = df.dropna(axis=1, how="all").copy()
-        df.columns = [str(c).strip() for c in df.columns]
+
+        # remove nomes de colunas vazios/duplicados mantendo a 1a ocorrência
+        cols_norm = []
+        seen = set()
+        keep_cols = []
+        for c in df.columns:
+            nome = str(c).strip()
+            if nome == "" or nome.lower() == "nan":
+                continue
+            if nome in seen:
+                continue
+            seen.add(nome)
+            cols_norm.append(nome)
+            keep_cols.append(c)
+
+        df = df.loc[:, keep_cols].copy()
+        df.columns = cols_norm
 
         col_terminal = next((c for c in df.columns if str(c).strip().upper() == "TERMINAL"), None)
         col_produto = next((c for c in df.columns if str(c).strip().upper() == "PRODUTO"), None)
@@ -319,14 +337,12 @@ async def transformar_terminal(file: UploadFile = File(...)):
         idx_operacao = cols.index(col_operacao)
 
         inicio = min(idx_terminal, idx_produto, idx_operacao)
-        fim_meses = idx_operacao + 12
-
-        if fim_meses >= len(cols):
-            fim_meses = len(cols) - 1
+        fim_meses = min(idx_operacao + 12, len(cols) - 1)
 
         cols_bloco = cols[inicio:fim_meses + 1]
         df = df[cols_bloco].copy()
 
+        # redefine colunas após corte
         col_terminal = next((c for c in df.columns if str(c).strip().upper() == "TERMINAL"), None)
         col_produto = next((c for c in df.columns if str(c).strip().upper() == "PRODUTO"), None)
         col_operacao = next(
@@ -350,10 +366,10 @@ async def transformar_terminal(file: UploadFile = File(...)):
             if ano is not None and mes is not None:
                 colunas_meses_validas.append(c)
 
-        if len(colunas_meses_validas) != 12:
+        if len(colunas_meses_validas) == 0:
             raise HTTPException(
                 status_code=400,
-                detail=f"Não encontrei as 12 colunas mensais esperadas. Colunas lidas: {list(df.columns)}"
+                detail=f"Nenhuma coluna mensal válida encontrada. Colunas lidas: {list(df.columns)}"
             )
 
         operacoes_validas = ["imp", "exp", "cab", "exp/imp"]
@@ -369,12 +385,13 @@ async def transformar_terminal(file: UploadFile = File(...)):
             (df[col_operacao].str.lower().isin(operacoes_validas))
         ].copy()
 
-        temp_meses = df[colunas_meses_validas].copy()
-        for col in colunas_meses_validas:
-            temp_meses[col] = temp_meses[col].apply(converter_mov)
+        # mantém só linhas com pelo menos um mês preenchido
+        temp_meses = df.loc[:, colunas_meses_validas].copy()
+        for nome_col in colunas_meses_validas:
+            temp_meses[nome_col] = temp_meses[nome_col].map(converter_mov)
 
         mask_tem_valor = temp_meses.notna().any(axis=1)
-        df = df[mask_tem_valor].copy()
+        df = df.loc[mask_tem_valor].copy()
 
         df_long = df.melt(
             id_vars=[col_terminal, col_produto, col_operacao],
@@ -395,15 +412,15 @@ async def transformar_terminal(file: UploadFile = File(...)):
             ~df_long[col_terminal].astype(str).str.strip().str.lower().str.startswith("total", na=False)
         ].copy()
 
-        df_long["Mov (TON)"] = df_long["Mov (TON)"].apply(converter_mov)
+        df_long["Mov (TON)"] = df_long["Mov (TON)"].map(converter_mov)
         df_long = df_long[df_long["Mov (TON)"].notna()].copy()
 
         df_long = df_long[df_long["Mov (TON)"] > 0].copy()
         df_long = df_long[df_long["Mov (TON)"] < 1000000].copy()
 
-        df_long[["ANO", "MES_NUM"]] = df_long["MES_ANO"].apply(
-            lambda x: pd.Series(extrair_mes_ano(x))
-        )
+        ano_mes = df_long["MES_ANO"].map(extrair_mes_ano)
+        df_long["ANO"] = [x[0] for x in ano_mes]
+        df_long["MES_NUM"] = [x[1] for x in ano_mes]
 
         df_long = df_long[df_long["ANO"].notna()].copy()
         df_long = df_long[df_long["MES_NUM"].notna()].copy()
