@@ -1,254 +1,3 @@
-from io import BytesIO
-import re
-import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-ABA_ALVO = "Projeção - Ton. Movimentação"
-
-MESES = [
-    "janeiro", "fevereiro", "março", "abril", "maio", "junho",
-    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"
-]
-
-MAPA_MESES = {
-    1: "Janeiro",
-    2: "Fevereiro",
-    3: "Março",
-    4: "Abril",
-    5: "Maio",
-    6: "Junho",
-    7: "Julho",
-    8: "Agosto",
-    9: "Setembro",
-    10: "Outubro",
-    11: "Novembro",
-    12: "Dezembro",
-}
-
-SIGLA_PARA_MES = {
-    "jan": 1,
-    "fev": 2,
-    "mar": 3,
-    "abr": 4,
-    "mai": 5,
-    "jun": 6,
-    "jul": 7,
-    "ago": 8,
-    "set": 9,
-    "out": 10,
-    "nov": 11,
-    "dez": 12,
-}
-
-
-def normalizar_colunas(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
-
-
-def ct_valido(valor) -> bool:
-    if pd.isna(valor):
-        return False
-    texto = str(valor).strip().upper()
-    return bool(re.match(r"^CT-\d+[A-Z]?$", texto))
-
-
-def detectar_engine(nome_arquivo: str) -> str:
-    nome = nome_arquivo.lower()
-
-    if nome.endswith(".xls"):
-        return "xlrd"
-    if nome.endswith(".xlsx") or nome.endswith(".xlsm"):
-        return "openpyxl"
-
-    raise HTTPException(
-        status_code=400,
-        detail="Formato inválido. Envie .xls, .xlsx ou .xlsm."
-    )
-
-
-def extrair_mes_ano(valor):
-    if isinstance(valor, pd.Timestamp):
-        return valor.year, valor.month
-
-    texto = str(valor).strip()
-
-    try:
-        dt = pd.to_datetime(texto, errors="raise")
-        if pd.notna(dt):
-            return dt.year, dt.month
-    except Exception:
-        pass
-
-    m = re.match(r"^(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)/(\d{2})$", texto.lower())
-    if m:
-        sigla = m.group(1)
-        ano = int("20" + m.group(2))
-        mes = SIGLA_PARA_MES[sigla]
-        return ano, mes
-
-    return None, None
-
-
-def converter_mov(valor):
-    if pd.isna(valor):
-        return None
-
-    if isinstance(valor, (int, float)) and not isinstance(valor, bool):
-        return float(valor)
-
-    texto = str(valor).strip()
-
-    if texto == "" or texto.lower() == "nan":
-        return None
-
-    if re.match(r"^\d{4}-\d{2}-\d{2}", texto):
-        return None
-
-    texto = texto.replace(".", "").replace(",", ".")
-
-    try:
-        return float(texto)
-    except Exception:
-        return None
-
-
-@app.get("/")
-def home():
-    return {"ok": True, "mensagem": "API online"}
-
-
-# ========================
-# ROTA 1 - BASE COMERCIAL
-# ========================
-@app.post("/transformar")
-async def transformar(file: UploadFile = File(...)):
-    try:
-        if not file.filename:
-            raise HTTPException(status_code=400, detail="Arquivo não enviado.")
-
-        engine = detectar_engine(file.filename)
-
-        conteudo = await file.read()
-        entrada = BytesIO(conteudo)
-
-        try:
-            xls = pd.ExcelFile(entrada, engine=engine)
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Não foi possível ler o Excel: {str(e)}"
-            )
-
-        if ABA_ALVO not in xls.sheet_names:
-            raise HTTPException(
-                status_code=400,
-                detail=f"A aba '{ABA_ALVO}' não foi encontrada no arquivo."
-            )
-
-        df = pd.read_excel(
-            xls,
-            sheet_name=ABA_ALVO,
-            header=1,
-            engine=engine
-        )
-
-        df = normalizar_colunas(df)
-
-        colunas_obrigatorias = ["CT", "Cliente", "Produto"]
-        faltando = [c for c in colunas_obrigatorias if c not in df.columns]
-        if faltando:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Colunas obrigatórias ausentes: {faltando}"
-            )
-
-        meses_existentes = [m for m in MESES if m in df.columns]
-        if not meses_existentes:
-            raise HTTPException(
-                status_code=400,
-                detail="Nenhuma coluna de mês encontrada."
-            )
-
-        df["CT"] = df["CT"].astype(str).str.strip()
-        df = df[df["CT"].apply(ct_valido)].copy()
-
-        df["Cliente"] = df["Cliente"].astype(str).str.strip()
-        df["Produto"] = df["Produto"].astype(str).str.strip()
-
-        df = df[
-            (df["Cliente"] != "") &
-            (df["Produto"] != "") &
-            (df["Cliente"].str.lower() != "nan") &
-            (df["Produto"].str.lower() != "nan") &
-            (~df["Cliente"].str.contains(r"adicione\s*0\s*linha", case=False, na=False)) &
-            (~df["Produto"].str.contains(r"^total$", case=False, na=False))
-        ].copy()
-
-        df_final = df.melt(
-            id_vars=["CT", "Cliente", "Produto"],
-            value_vars=meses_existentes,
-            var_name="MÊS",
-            value_name="Movimentação(TON)"
-        )
-
-        df_final["Movimentação(TON)"] = pd.to_numeric(
-            df_final["Movimentação(TON)"],
-            errors="coerce"
-        )
-
-        df_final = df_final[df_final["Movimentação(TON)"].notna()].copy()
-        df_final = df_final[df_final["Movimentação(TON)"] > 0].copy()
-
-        df_final["ANO"] = 2026
-
-        df_final = df_final[[
-            "ANO",
-            "MÊS",
-            "Cliente",
-            "Produto",
-            "Movimentação(TON)"
-        ]]
-
-        saida = BytesIO()
-        with pd.ExcelWriter(saida, engine="openpyxl") as writer:
-            df_final.to_excel(writer, index=False, sheet_name="Base Padronizada")
-
-        saida.seek(0)
-
-        return StreamingResponse(
-            saida,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={
-                "Content-Disposition": "attachment; filename=base_padronizada.xlsx",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao processar arquivo: {repr(e)}"
-        )
-
-
-# ========================
-# ROTA 2 - TERMINAIS
-# ========================
 @app.post("/transformar_terminal")
 async def transformar_terminal(file: UploadFile = File(...)):
     try:
@@ -286,6 +35,7 @@ async def transformar_terminal(file: UploadFile = File(...)):
                 detail="Não foi possível localizar o cabeçalho da tabela principal."
             )
 
+        # usa o cabeçalho bruto inteiro, sem tentar reduzir tamanho aqui
         header = [str(x).strip() for x in df_raw.loc[header_idx].tolist()]
         df = df_raw.loc[header_idx + 1:].copy()
         df.columns = header
@@ -293,29 +43,21 @@ async def transformar_terminal(file: UploadFile = File(...)):
         # remove colunas totalmente vazias
         df = df.dropna(axis=1, how="all").copy()
 
-        # remove nomes de colunas vazios/duplicados mantendo a 1a ocorrência
-        cols_norm = []
-        seen = set()
-        keep_cols = []
-        for c in df.columns:
-            nome = str(c).strip()
-            if nome == "" or nome.lower() == "nan":
-                continue
-            if nome in seen:
-                continue
-            seen.add(nome)
-            cols_norm.append(nome)
-            keep_cols.append(c)
+        # normaliza nomes
+        df.columns = [str(c).strip() for c in df.columns]
 
-        df = df.loc[:, keep_cols].copy()
-        df.columns = cols_norm
+        # pega primeira ocorrência das colunas principais
+        cols = list(df.columns)
 
-        col_terminal = next((c for c in df.columns if str(c).strip().upper() == "TERMINAL"), None)
-        col_produto = next((c for c in df.columns if str(c).strip().upper() == "PRODUTO"), None)
-        col_operacao = next(
-            (c for c in df.columns if str(c).strip().upper() in ["OPERAÇÃO", "OPERACAO"]),
-            None
-        )
+        def primeira_coluna_igual(alvos):
+            for i, c in enumerate(cols):
+                if str(c).strip().upper() in alvos:
+                    return i, c
+            return None, None
+
+        idx_terminal, col_terminal = primeira_coluna_igual({"TERMINAL"})
+        idx_produto, col_produto = primeira_coluna_igual({"PRODUTO"})
+        idx_operacao, col_operacao = primeira_coluna_igual({"OPERAÇÃO", "OPERACAO"})
 
         faltando = []
         if col_terminal is None:
@@ -331,24 +73,25 @@ async def transformar_terminal(file: UploadFile = File(...)):
                 detail=f"Colunas obrigatórias ausentes: {faltando}"
             )
 
-        cols = list(df.columns)
-        idx_terminal = cols.index(col_terminal)
-        idx_produto = cols.index(col_produto)
-        idx_operacao = cols.index(col_operacao)
-
+        # pega exatamente o bloco da tabela:
+        # TERMINAL | PRODUTO | OPERAÇÃO | 12 meses
         inicio = min(idx_terminal, idx_produto, idx_operacao)
-        fim_meses = min(idx_operacao + 12, len(cols) - 1)
+        fim = idx_operacao + 12
 
-        cols_bloco = cols[inicio:fim_meses + 1]
-        df = df[cols_bloco].copy()
+        if fim >= len(cols):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Não encontrei 12 colunas mensais após OPERAÇÃO. Colunas lidas: {cols}"
+            )
 
-        # redefine colunas após corte
-        col_terminal = next((c for c in df.columns if str(c).strip().upper() == "TERMINAL"), None)
-        col_produto = next((c for c in df.columns if str(c).strip().upper() == "PRODUTO"), None)
-        col_operacao = next(
-            (c for c in df.columns if str(c).strip().upper() in ["OPERAÇÃO", "OPERACAO"]),
-            None
-        )
+        cols_bloco = cols[inicio:fim + 1]
+        df = df.loc[:, cols_bloco].copy()
+
+        # redefine nomes após corte
+        cols = list(df.columns)
+        col_terminal = next((c for c in cols if str(c).strip().upper() == "TERMINAL"), None)
+        col_produto = next((c for c in cols if str(c).strip().upper() == "PRODUTO"), None)
+        col_operacao = next((c for c in cols if str(c).strip().upper() in ["OPERAÇÃO", "OPERACAO"]), None)
 
         df[col_terminal] = df[col_terminal].ffill()
 
@@ -356,24 +99,31 @@ async def transformar_terminal(file: UploadFile = File(...)):
         df[col_produto] = df[col_produto].astype(str).str.strip()
         df[col_operacao] = df[col_operacao].astype(str).str.strip()
 
-        cols = list(df.columns)
         idx_operacao = cols.index(col_operacao)
         colunas_meses = cols[idx_operacao + 1: idx_operacao + 13]
 
-        colunas_meses_validas = []
+        if len(colunas_meses) != 12:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Esperadas 12 colunas mensais, encontradas {len(colunas_meses)}."
+            )
+
+        # valida que as 12 colunas são realmente mês/ano
+        meses_ok = []
         for c in colunas_meses:
             ano, mes = extrair_mes_ano(c)
             if ano is not None and mes is not None:
-                colunas_meses_validas.append(c)
+                meses_ok.append(c)
 
-        if len(colunas_meses_validas) == 0:
+        if len(meses_ok) != 12:
             raise HTTPException(
                 status_code=400,
-                detail=f"Nenhuma coluna mensal válida encontrada. Colunas lidas: {list(df.columns)}"
+                detail=f"As 12 colunas após OPERAÇÃO não são meses válidos. Colunas: {colunas_meses}"
             )
 
         operacoes_validas = ["imp", "exp", "cab", "exp/imp"]
 
+        # remove linhas inválidas
         df = df[
             (df[col_produto] != "") &
             (df[col_produto].str.lower() != "nan") &
@@ -385,17 +135,17 @@ async def transformar_terminal(file: UploadFile = File(...)):
             (df[col_operacao].str.lower().isin(operacoes_validas))
         ].copy()
 
-        # mantém só linhas com pelo menos um mês preenchido
-        temp_meses = df.loc[:, colunas_meses_validas].copy()
-        for nome_col in colunas_meses_validas:
-            temp_meses[nome_col] = temp_meses[nome_col].map(converter_mov)
+        # mantém só linhas com pelo menos 1 valor mensal real
+        temp_meses = df.loc[:, meses_ok].copy()
+        for col in meses_ok:
+            temp_meses[col] = temp_meses[col].map(converter_mov)
 
         mask_tem_valor = temp_meses.notna().any(axis=1)
         df = df.loc[mask_tem_valor].copy()
 
         df_long = df.melt(
             id_vars=[col_terminal, col_produto, col_operacao],
-            value_vars=colunas_meses_validas,
+            value_vars=meses_ok,
             var_name="MES_ANO",
             value_name="Mov (TON)"
         )
